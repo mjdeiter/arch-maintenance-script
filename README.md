@@ -1,9 +1,6 @@
-Here's your updated README.md with all emojis removed from the Features list, Audit section, and everywhere else.
+# Arch System Cleanup Script
 
-````markdown name=README.md url=https://github.com/mjdeiter/arch-cleanup-script/blob/bd59946dfe3eb37c8a77e3a1e759bc2a807a8a5c/README.md
-# CachyOS System Cleanup Script
-
-Enterprise-grade system maintenance script for CachyOS and Arch-based Linux distributions. Automates package updates, cache cleaning, orphan removal, and system cleanup with robust error handling and safety features.
+Enterprise-grade system maintenance script for Arch and Arch-based Linux distributions. Automates package updates, cache cleaning, orphan removal, and system cleanup with robust error handling and safety features.
 
 ## Features
 
@@ -34,21 +31,20 @@ sudo pacman -S bc cronie jq logrotate
 ### Quick Install
 ```bash
 # Download script
-wget https://raw.githubusercontent.com/yourusername/cachyos-cleanup/main/cachyos_cleanup.sh
-
+wget https://github.com/mjdeiter/arch-cleanup-script/
 # Make executable
-chmod +x cachyos_cleanup.sh
+chmod +x arch-maintenance.sh
 
 # Move to system path (optional)
-sudo mv cachyos_cleanup.sh /usr/local/bin/cachyos-cleanup
+sudo mv arch-maintenance.sh /usr/local/bin/Arch-cleanup
 ```
 
 ### From Source
 ```bash
-git clone https://github.com/yourusername/cachyos-cleanup.git
-cd cachyos-cleanup
-chmod +x cachyos_cleanup.sh
-sudo ./cachyos_cleanup.sh
+git clone https://github.com/yourusername/Arch-cleanup.git
+cd Arch-cleanup
+chmod +x arch-maintenance.sh
+sudo ./arch-maintenance.sh
 ```
 
 ## Usage
@@ -56,67 +52,67 @@ sudo ./cachyos_cleanup.sh
 ### Basic Usage
 ```bash
 # Run full cleanup
-sudo ./cachyos_cleanup.sh
+sudo ./arch-maintenance.sh
 
 # Interactive mode (confirm each operation)
-sudo ./cachyos_cleanup.sh -i
+sudo ./arch-maintenance.sh -i
 
 # Dry run (preview changes only)
-sudo ./cachyos_cleanup.sh --analyze
+sudo ./arch-maintenance.sh --analyze
 
 # Verbose output
-sudo ./cachyos_cleanup.sh -v
+sudo ./arch-maintenance.sh -v
 ```
 
 ### Selective Cleaning
 ```bash
 # Only clean cache and orphans
-sudo ./cachyos_cleanup.sh --clean-cache --clean-orphans
+sudo ./arch-maintenance.sh --clean-cache --clean-orphans
 
 # Skip system updates
-sudo ./cachyos_cleanup.sh --skip-update
+sudo ./arch-maintenance.sh --skip-update
 
 # Disable specific tasks
-sudo ./cachyos_cleanup.sh --no-logs --no-user-cache
+sudo ./arch-maintenance.sh --no-logs --no-user-cache
 ```
 
 ### Automation
 ```bash
 # Install daily cron job
-sudo ./cachyos_cleanup.sh --install-cron @daily
+sudo ./arch-maintenance.sh --install-cron @daily
 
 # Install weekly cron job
-sudo ./cachyos_cleanup.sh --install-cron @weekly
+sudo ./arch-maintenance.sh --install-cron @weekly
 
 # Custom schedule (2 AM daily)
-sudo ./cachyos_cleanup.sh --install-cron "0 2 * * *"
+sudo ./arch-maintenance.sh --install-cron "0 2 * * *"
 
 # Remove cron job
-sudo ./cachyos_cleanup.sh --remove-cron
+sudo ./arch-maintenance.sh --remove-cron
 ```
 
 ### Reports & History
 ```bash
 # Export JSON report
-sudo ./cachyos_cleanup.sh --json
+sudo ./arch-maintenance.sh --json
 
 # Export CSV report
-sudo ./cachyos_cleanup.sh --csv
+sudo ./arch-maintenance.sh --csv
 
 # View cleanup history
-sudo ./cachyos_cleanup.sh --history
+sudo ./arch-maintenance.sh --history
 ```
 
 ## Configuration
 
 ### Create Config File
 ```bash
-sudo ./cachyos_cleanup.sh --create-config
+sudo ./arch-maintenance.sh --create-config
 ```
 
 ### Edit Configuration
 ```bash
-sudo nano /etc/cachyos-cleanup.conf
+sudo nano /etc/Arch-cleanup.conf
 ```
 
 ### Key Settings
@@ -200,10 +196,10 @@ Before cleanup, the script creates snapshots of:
 - Configuration files
 - Data directory
 
-Snapshots are stored in `/var/lib/cachyos-cleanup/snapshots/`
+Snapshots are stored in `/var/lib/Arch-cleanup/snapshots/`
 
 ### Whitelist Support
-Create `/var/lib/cachyos-cleanup/whitelist.conf` to exclude paths from cleanup:
+Create `/var/lib/Arch-cleanup/whitelist.conf` to exclude paths from cleanup:
 ```bash
 /var/log/important.log
 /home/user/.cache/keep-this
@@ -218,20 +214,20 @@ Uses `systemd-tmpfiles --clean` and age-based filtering (7 days) instead of aggr
 ```bash
 #!/bin/bash
 # Run weekly cleanup with updates
-sudo cachyos-cleanup -n --skip-update
+sudo Arch-cleanup -n --skip-update
 ```
 
 ### Monthly Deep Clean
 ```bash
 #!/bin/bash
 # Monthly deep clean with all features
-sudo cachyos-cleanup -v --json --csv
+sudo Arch-cleanup -v --json --csv
 ```
 
 ### Cron-Friendly Run
 ```bash
 # Colors/emoji auto-disabled when not a TTY
-sudo cachyos-cleanup -n > /var/log/cleanup.log 2>&1
+sudo Arch-cleanup -n > /var/log/cleanup.log 2>&1
 ```
 
 ## Output Example
@@ -264,7 +260,7 @@ EXECUTION STATISTICS
 ### Permission Denied
 Script must run as root:
 ```bash
-sudo ./cachyos_cleanup.sh
+sudo ./arch-maintenance.sh
 ```
 
 ### Missing Dependencies
@@ -289,12 +285,12 @@ sudo systemctl status cronie
 ## Architecture
 
 ### File Locations
-- **Script**: `/usr/local/bin/cachyos-cleanup.sh`
-- **Config**: `/etc/cachyos-cleanup.conf`
-- **Data**: `/var/lib/cachyos-cleanup/`
-- **Snapshots**: `/var/lib/cachyos-cleanup/snapshots/`
-- **History**: `/var/lib/cachyos-cleanup/cleanup-history.json`
-- **Logs**: `/tmp/cachyos-cleanup-*.log` (ephemeral)
+- **Script**: `/usr/local/bin/Arch-cleanup.sh`
+- **Config**: `/etc/Arch-cleanup.conf`
+- **Data**: `/var/lib/Arch-cleanup/`
+- **Snapshots**: `/var/lib/Arch-cleanup/snapshots/`
+- **History**: `/var/lib/Arch-cleanup/cleanup-history.json`
+- **Logs**: `/tmp/Arch-cleanup-*.log` (ephemeral)
 
 ### Security
 - Data directories use mode 700 (owner-only access)
@@ -321,7 +317,7 @@ sudo systemctl status cronie
 Contributions welcome! Please:
 1. Fork the repository
 2. Create a feature branch
-3. Test thoroughly on CachyOS/Arch
+3. Test thoroughly on Arch/Arch
 4. Submit a pull request
 
 ## License
@@ -330,9 +326,9 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/cachyos-cleanup/issues)
-- **Wiki**: [Documentation](https://github.com/yourusername/cachyos-cleanup/wiki)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/cachyos-cleanup/discussions)
+- **Issues**: [GitHub Issues](https://github.com/yourusername/Arch-cleanup/issues)
+- **Wiki**: [Documentation](https://github.com/yourusername/Arch-cleanup/wiki)
+- **Discussions**: [GitHub Discussions](https://github.com/yourusername/Arch-cleanup/discussions)
 
 ## Changelog
 
@@ -363,7 +359,7 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## Acknowledgments
 
-Built for the CachyOS community with feedback from system administrators and security auditors.
+Built for the Arch community with feedback from system administrators and security auditors.
 
 ---
 
