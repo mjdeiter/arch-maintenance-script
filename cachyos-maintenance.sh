@@ -41,7 +41,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # CONSTANTS & CONFIGURATION
 #######################################
 readonly SCRIPT_NAME="archOS Cleanup"
-readonly SCRIPT_VERSION="4.2.0"
+readonly SCRIPT_VERSION="4.2.2"
 
 readonly DATA_DIR="/var/lib/archos-cleanup"
 readonly SNAPSHOT_DIR="${DATA_DIR}/snapshots"
@@ -943,8 +943,15 @@ scan_broken_links() {
     return
   fi
 
-  # Refresh ldconfig cache first so we don't get false positives from a stale cache
-  ldconfig 2>/dev/null || true
+  # Refresh ldconfig cache first so we don't get false positives from a stale cache.
+  # Must run as root; fall back to unprivileged if sudo unavailable (e.g. in hooks).
+  sudo ldconfig 2>/dev/null || ldconfig 2>/dev/null || true
+
+  # Known false positives: cross-name symlinks whose soname doesn't appear in the
+  # ldconfig cache by the aliased name but resolve correctly at runtime via /usr/lib.
+  local -a SENTRY_IGNORE=(
+    "libvapoursynth-script.so.0"  # symlink -> libvsscript.so; resolves fine via /usr/lib
+  )
 
   # ldd-based scan: iterate over all ELF files owned by pacman packages
   while IFS= read -r elf; do
@@ -953,7 +960,17 @@ scan_broken_links() {
     if echo "$ldd_out" | grep -q "not found"; then
       local missing
       missing=$(echo "$ldd_out" | awk '/not found/{print $1}' | sort -u | tr '\n' ' ')
-      printf '%s: %s\n' "$elf" "$missing" >> "$tmpout"
+      # Filter out known-ignored sonames
+      local filtered_missing=""
+      for soname in $missing; do
+        local ignored=false
+        for ignore_pat in "${SENTRY_IGNORE[@]}"; do
+          [[ "$soname" == "$ignore_pat" ]] && ignored=true && break
+        done
+        $ignored || filtered_missing+="$soname "
+      done
+      [[ -z "${filtered_missing// }" ]] && continue
+      printf '%s: %s\n' "$elf" "$filtered_missing" >> "$tmpout"
       (( broken_count++ )) || true
     fi
   done < <(pacman -Ql 2>/dev/null \

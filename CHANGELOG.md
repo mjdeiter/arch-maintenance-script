@@ -4,6 +4,20 @@ All notable changes to cachyos-maintenance.sh are documented here.
 
 ---
 
+## [4.2.2] — library sentry hardening
+
+### Fixed
+- `Library Sentry`: `ldconfig` now runs with `sudo` (falling back to unprivileged) so the
+  cache is always current when the sentry runs, including during pacman hook invocations
+- Added `SENTRY_IGNORE` array to filter known cross-name symlink false positives;
+  `libvapoursynth-script.so.0` (a symlink → `libvsscript.so`) suppressed by default
+
+### Added
+- Installed `jasper` (JPEG-2000 codec) — fixes GraphicsMagick `jp2.so` missing `libjasper.so.7`
+- Installed `qt6-canvaspainter` — fixes PySide6 `QtCanvasPainter` missing `libQt6CanvasPainter.so.6`
+
+---
+
 ## [4.2.1] — dry-run hardening
 
 ### Fixed
