@@ -1,6 +1,6 @@
 #!/bin/bash
 # archOS / CachyOS System Cleanup and Update Script - ENTERPRISE EDITION
-# Version: 4.0.1
+# Version: 4.1.1
 #
 # Optimizations & Fixes:
 #   - Added command-line argument support
@@ -14,9 +14,23 @@
 #   - Docker Compose stack detection and graceful shutdown before reboot
 #   - Kernel mismatch / reboot detection
 #   - Optional interactive reboot prompt (--interactive)
+#   - Broken shared library scan with timed interactive prompt (--skip-broken-links)
+#
+# v4.1.3 additions:
+# - resolve_aur_dep_conflicts(): auto-detects AUR pkgs blocking repo soname bumps,
+#   rebuilds via yay, retries pacman -Su on success
+# - pacman -Su call wrapped with dep-conflict stderr capture + retry logic
+#
+# v4.1.1 fixes:
+#   - error(): ((STATS[error_count]++)) caused set -e exit when counter was 0
+#   - with_pacman_lock: flock timeout now returns early instead of silently proceeding
+#   - count_aur_updates: guard against empty AUR_USER to avoid sudo -u "" errors
+#   - remove_orphans: replaced unsafe $orphans word-split with mapfile + array expansion
+#   - version_gt: replaced fragile local IFS=. array expansion with read -ra
+#   - get_hp_platform_id: eliminated UUOC (cat file | tr → tr < file)
 #
 # No interactive prompts by default. Safe for cron/systemd timers.
-# Use --interactive to enable reboot prompts and Docker shutdown.
+# Use --interactive to enable reboot/scan prompts and Docker shutdown.
 
 set -euo pipefail
 shopt -s nullglob
@@ -27,10 +41,11 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # CONSTANTS & CONFIGURATION
 #######################################
 readonly SCRIPT_NAME="archOS Cleanup"
-readonly SCRIPT_VERSION="4.0.1"
+readonly SCRIPT_VERSION="4.2.0"
 
 readonly DATA_DIR="/var/lib/archos-cleanup"
 readonly SNAPSHOT_DIR="${DATA_DIR}/snapshots"
+readonly AUTO_LOG_DIR="/var/log/archos-cleanup"
 
 readonly SYSTEM_LOG_DIR="/var/log"
 readonly VAR_TMP_DIR="/var/tmp"
@@ -39,13 +54,22 @@ readonly MAX_SNAPSHOTS=10
 readonly LOG_RETENTION_DAYS=7
 readonly CACHE_VERSIONS=3
 
+# HP BIOS update settings
+readonly HP_DEVFW_PATH="/boot/EFI/HP/DEVFW"
+readonly HP_FTP_BASE="https://ftp.hp.com/pub"
+
 ENABLE_BACKUPS=true
 LOG_LEVEL="INFO"
 DRY_RUN=false
 SKIP_UPDATE=false
+SKIP_BIOS_CHECK=false
+SKIP_BROKEN_LINKS=false
+IGNORE_PKGS=()  # packages to pass to pacman --ignore
 INTERACTIVE=false
 LOG_FILE=""
+AUTO_LOG_FILE=""
 AUR_USER=""
+BIOS_UPDATE_STAGED=false
 
 declare -A STATS=(
   [packages_before]=0
@@ -53,6 +77,7 @@ declare -A STATS=(
   [packages_removed]=0
   [updates_repo]=0
   [updates_aur]=0
+  [bios_staged]=0
   [error_count]=0
 )
 
@@ -73,6 +98,9 @@ OPTIONS:
   -n, --no-backups        Disable Btrfs snapshots
   -i, --interactive       Enable interactive mode (reboot prompt + Docker shutdown)
   -l, --log-file <path>   Also write log output to a file
+      --skip-bios-check   Skip HP BIOS update check
+      --skip-broken-links Skip broken shared library scan (also skips the prompt)
+  -i, --ignore-pkg PKG  Skip a package during update (repeatable; comma-sep ok)
   -V, --version           Show version information
 
 EXAMPLES:
@@ -119,6 +147,18 @@ parse_args() {
       -i|--interactive)
         INTERACTIVE=true
         ;;
+      --skip-bios-check)
+        SKIP_BIOS_CHECK=true
+        ;;
+      --skip-broken-links)
+        SKIP_BROKEN_LINKS=true
+        ;;
+      -i|--ignore-pkg)
+        [[ $# -gt 1 ]] || { echo "Error: --ignore-pkg requires a package name"; exit 1; }
+        IFS="," read -ra _pkgs <<< "$2"
+        IGNORE_PKGS+=("${_pkgs[@]}")
+        shift
+        ;;
       -l|--log-file)
         [[ $# -gt 1 ]] || { echo "Error: --log-file requires a path argument"; exit 1; }
         LOG_FILE="$2"
@@ -147,6 +187,9 @@ log() {
   local msg
   msg="$(date '+%F %T') [$level] $*"
   echo "$msg" >&2
+  if [[ -n "$AUTO_LOG_FILE" ]]; then
+    echo "$msg" >> "$AUTO_LOG_FILE"
+  fi
   if [[ -n "$LOG_FILE" ]]; then
     echo "$msg" >> "$LOG_FILE"
   fi
@@ -154,12 +197,17 @@ log() {
 debug(){ log DEBUG "$*"; }
 info(){ log INFO "$*"; }
 warn(){ log WARN "$*"; }
-error(){ ((STATS[error_count]++)); log ERROR "$*"; }
+error(){
+  local _ec=$(( STATS[error_count] + 1 ))
+  STATS[error_count]=$_ec
+  log ERROR "$*"
+}
 
 #######################################
 # SAFETY
 #######################################
 check_root() {
+  $DRY_RUN && { warn "Dry-run mode: skipping root check"; return; }
   [[ $EUID -eq 0 ]] || { echo "Must be run as root"; exit 1; }
   if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
     AUR_USER="$SUDO_USER"
@@ -172,7 +220,7 @@ with_pacman_lock() {
   local lock="/var/lib/pacman/.cleanup.lock"
   debug "Acquiring pacman lock: $lock"
   exec {fd}>>"$lock"
-  flock -w 300 "$fd"
+  flock -w 300 "$fd" || { warn "Timed out waiting for pacman lock"; exec {fd}>&-; return 1; }
   "$@"
   local rc=$?
   debug "Released pacman lock"
@@ -215,6 +263,12 @@ count_repo_updates() {
 count_aur_updates() {
   debug "Counting AUR updates..."
   local count=0
+
+  if [[ -z "$AUR_USER" ]]; then
+    debug "No AUR_USER set; skipping AUR update count"
+    echo 0
+    return
+  fi
 
   if command -v paru >/dev/null 2>&1; then
     count=$(timeout 30 sudo -u "$AUR_USER" paru -Qua 2>/dev/null | wc -l | tr -d '[:space:]') || count=0
@@ -356,6 +410,12 @@ handle_reboot() {
   local reboot_needed
   reboot_needed=$(check_reboot_needed)
 
+  # Also flag reboot if a BIOS update was staged
+  if $BIOS_UPDATE_STAGED; then
+    reboot_needed=1
+    warn "HP BIOS update staged — reboot required, then F10 → Update System BIOS"
+  fi
+
   if [[ "$reboot_needed" -eq 1 ]]; then
     if $INTERACTIVE; then
       warn "Kernel update detected — a reboot is recommended"
@@ -390,10 +450,87 @@ sync_databases() {
   return 0
 }
 
+
+# -----------------------------------------------------------------------------
+# resolve_aur_dep_conflicts [v4.1.3]
+# Parses pacman dep-conflict stderr, identifies AUR-only offenders, rebuilds
+# them via yay against freshly updated repo libs (e.g. boost/openssl soname
+# bumps). Returns 0 if ≥1 package was rebuilt so the caller can retry.
+# -----------------------------------------------------------------------------
+resolve_aur_dep_conflicts() {
+  local pacman_stderr="$1"
+
+  local conflict_pkgs
+  conflict_pkgs=$(echo "$pacman_stderr"     | grep -oP "required by \K[a-zA-Z0-9@._+\-]+"     | sort -u)
+
+  if [[ -z "$conflict_pkgs" ]]; then
+    warn "Dep-conflict detected but could not parse offending package names"
+    return 1
+  fi
+
+  local aur_pkgs=()
+  while IFS= read -r pkg; do
+    if ! pacman -Si "$pkg" &>/dev/null; then
+      aur_pkgs+=("$pkg")
+    fi
+  done <<< "$conflict_pkgs"
+
+  if [[ ${#aur_pkgs[@]} -eq 0 ]]; then
+    warn "Dep-conflict packages are all from repos — cannot auto-resolve"
+    return 1
+  fi
+
+  info "AUR dep-conflict: rebuilding [${aur_pkgs[*]}] against new repo libs..."
+  local rebuilt=0
+  for pkg in "${aur_pkgs[@]}"; do
+    debug "  yay --rebuild $pkg"
+    if sudo -u "$AUR_USER" yay -S --rebuild --noconfirm --noprogressbar "$pkg"; then
+      info "  [OK] $pkg rebuilt successfully"
+      (( rebuilt++ )) || true
+    else
+      warn "  [FAIL] Could not rebuild $pkg — skipping"
+    fi
+  done
+
+  [[ $rebuilt -gt 0 ]]
+}
 update_repo_packages() {
   if (( STATS[updates_repo] > 0 )); then
     info "Updating ${STATS[updates_repo]} repo package(s)..."
-    with_pacman_lock pacman -Su --noconfirm
+    # v4.1.3: dep-conflict auto-rebuild wrapper
+    # pacman writes dep-resolution errors to stdout. We tee both streams to a
+    # tempfile for post-run parsing while still showing output live.
+    # set +e guards the pipeline so set -euo pipefail doesn't kill the script
+    # before we can inspect the exit code and captured output.
+    local _pac_tmp _pac_rc=0
+    _pac_tmp=$(mktemp /tmp/pacman-upgrade.XXXXXX)
+    set +e
+    local _ignore_flag=""
+    if [[ ${#IGNORE_PKGS[@]} -gt 0 ]]; then
+      _ignore_flag="--ignore $(IFS=,; echo "${IGNORE_PKGS[*]}")"
+      info "Ignoring packages: ${IGNORE_PKGS[*]}"
+    fi
+    LANG=C with_pacman_lock pacman -Su --noconfirm $_ignore_flag 2>&1 | tee "$_pac_tmp"
+    _pac_rc=${PIPESTATUS[0]}
+    set -e
+    local _pac_output
+    _pac_output=$(cat "$_pac_tmp")
+    rm -f "$_pac_tmp"
+    if [[ $_pac_rc -ne 0 ]]; then
+      if echo "$_pac_output" | grep -q "could not satisfy dependencies"; then
+        warn "Dep-conflict detected — attempting AUR auto-rebuild..."
+        if resolve_aur_dep_conflicts "$_pac_output"; then
+          info "Rebuild succeeded — retrying repo upgrade..."
+          with_pacman_lock pacman -Su --noconfirm $_ignore_flag
+        else
+          warn "Auto-rebuild failed — manual intervention required"
+          return 1
+        fi
+      else
+        warn "pacman upgrade failed (rc=$_pac_rc)"
+        return 1
+      fi
+    fi
   else
     info "No repo updates to apply"
   fi
@@ -440,7 +577,9 @@ update_system() {
   info "AUR updates available:  ${STATS[updates_aur]}"
 
   if $DRY_RUN; then
-    info "[DRY RUN] Would update ${STATS[updates_repo]} repo + ${STATS[updates_aur]} AUR packages"
+    local _dry_ignore=""
+    [[ ${#IGNORE_PKGS[@]} -gt 0 ]] && _dry_ignore=" (ignoring: ${IGNORE_PKGS[*]})"
+    info "[DRY RUN] Would update ${STATS[updates_repo]} repo + ${STATS[updates_aur]} AUR packages${_dry_ignore}"
     return
   fi
 
@@ -468,8 +607,11 @@ remove_orphans() {
   count=$(echo "$orphans" | wc -l)
   info "Found $count orphaned package(s)"
   $DRY_RUN && { info "[DRY RUN] Would remove: $(echo "$orphans" | tr '\n' ' ')"; return; }
+  # Read into array to avoid word-splitting surprises
+  local -a orphan_list
+  mapfile -t orphan_list <<< "$orphans"
   # shellcheck disable=SC2086
-  with_pacman_lock pacman -Rns --noconfirm $orphans
+  with_pacman_lock pacman -Rns --noconfirm "${orphan_list[@]}"
 }
 
 clean_logs() {
@@ -487,21 +629,374 @@ clean_user_cache() {
 }
 
 #######################################
-# EXECUTION
+# HP BIOS UPDATE CHECK
+#######################################
+
+# Compare two dot-separated version strings. Returns 0 if $1 > $2.
+version_gt() {
+  local ver_a="$1" ver_b="$2"
+  local -a a b
+  IFS='.' read -ra a <<< "$ver_a"
+  IFS='.' read -ra b <<< "$ver_b"
+  local i
+  for ((i=0; i<${#a[@]}; i++)); do
+    (( 10#${a[i]:-0} > 10#${b[i]:-0} )) && return 0
+    (( 10#${a[i]:-0} < 10#${b[i]:-0} )) && return 1
+  done
+  return 1
+}
+
+get_current_bios_version() {
+  dmidecode -t bios 2>/dev/null \
+    | grep "Version:" \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+    | head -1
+}
+
+# Get HP's 4-char platform hex ID from DMI.
+# Commercial HP systems store it in product_sku (e.g. "96J89AV" -> first 4 hex chars elsewhere,
+# or directly in board product). Falls back to chassis-asset-tag if needed.
+get_hp_platform_id() {
+  local candidate
+
+  # Preferred source: /sys/class/dmi/id/product_sku — on HP commercial this is often
+  # something like "96J89AV#ABA". The platform hex code is a separate value stored in
+  # the chassis asset tag on some models.
+  candidate=$(tr -d '[:space:]' < /sys/class/dmi/id/chassis_asset_tag 2>/dev/null || true)
+  if echo "$candidate" | grep -qiE '^[0-9a-f]{4}$'; then
+    echo "$candidate" | tr '[:upper:]' '[:lower:]'
+    return
+  fi
+
+  # Some HP systems expose it via board_product
+  candidate=$(tr -d '[:space:]' < /sys/class/dmi/id/board_product 2>/dev/null || true)
+  if echo "$candidate" | grep -qiE '^[0-9a-f]{4}$'; then
+    echo "$candidate" | tr '[:upper:]' '[:lower:]'
+    return
+  fi
+
+  # Last resort: read from dmidecode System Information SKU
+  candidate=$(dmidecode -t 1 2>/dev/null | awk -F': ' '/SKU Number/{print $2}' | tr -d '[:space:]')
+  echo "$candidate" | tr '[:upper:]' '[:lower:]'
+}
+
+# Download HP's imagepal reference catalog for this platform and extract BIOS info.
+# Outputs "VERSION SP_URL" on success, empty string on failure.
+fetch_hp_bios_catalog() {
+  local platform_id="$1"
+  local work_dir="$2"
+
+  # HP names their catalog CABs with OS version suffixes; try most likely ones in order
+  local found_cab=false
+  for os_tag in win11 w11 win10; do
+    local url="${HP_FTP_BASE}/caps-softpaq/cmit/imagepal/ref/${platform_id}/${platform_id}_64_${os_tag}.cab"
+    debug "BIOS: Trying catalog URL: $url"
+    if curl -sf --max-time 30 -L "$url" -o "${work_dir}/ref.cab" 2>/dev/null; then
+      found_cab=true
+      debug "BIOS: Found catalog at $url"
+      break
+    fi
+  done
+
+  $found_cab || { debug "BIOS: No catalog found for platform ${platform_id}"; echo ""; return; }
+
+  # Extract CAB using 7z (already installed)
+  if ! 7z e "${work_dir}/ref.cab" -o"${work_dir}/extracted" -y >/dev/null 2>&1; then
+    warn "BIOS: Failed to extract HP catalog CAB"
+    echo ""
+    return
+  fi
+
+  local xml_file
+  xml_file=$(find "${work_dir}/extracted" -name "*.xml" 2>/dev/null | head -1)
+  if [[ -z "$xml_file" ]]; then
+    warn "BIOS: No XML found in HP catalog"
+    echo ""
+    return
+  fi
+
+  debug "BIOS: Parsing catalog XML: $xml_file"
+
+  # Extract the BIOS softpaq entry. HP's XML uses various tag names across versions
+  # so we match broadly on category=BIOS and pull the nearest version + URL/ID.
+  local bios_section
+  bios_section=$(grep -i -A 20 -B 2 'BIOS' "$xml_file" 2>/dev/null | head -60)
+
+  local bios_version
+  bios_version=$(echo "$bios_section" | grep -oE '[0-9]{2}\.[0-9]{2}\.[0-9]{2}' | sort -V | tail -1)
+
+  # Try to find a direct download URL in the XML first
+  local bios_url
+  bios_url=$(echo "$bios_section" | grep -oE 'https://ftp\.hp\.com/pub/softpaq/[^"<>]+\.exe' | head -1)
+
+  # If no URL in XML, derive it from the softpaq ID
+  if [[ -z "$bios_url" ]]; then
+    local sp_id
+    sp_id=$(echo "$bios_section" | grep -oiE 'sp[0-9]{5,6}' | head -1 | tr '[:upper:]' '[:lower:]')
+    if [[ -n "$sp_id" ]]; then
+      local sp_num="${sp_id#sp}"
+      local range_low=$(( (sp_num / 500) * 500 ))
+      local range_high=$(( range_low + 499 ))
+      bios_url="${HP_FTP_BASE}/softpaq/sp${range_low}-${range_high}/${sp_id}.exe"
+    fi
+  fi
+
+  if [[ -n "$bios_version" && -n "$bios_url" ]]; then
+    echo "${bios_version} ${bios_url}"
+  else
+    debug "BIOS: Could not parse version/URL from catalog (version='${bios_version}' url='${bios_url}')"
+    echo ""
+  fi
+}
+
+stage_bios_update() {
+  local softpaq_url="$1"
+  local work_dir="$2"
+
+  info "BIOS: Downloading SoftPaq: $(basename "$softpaq_url")..."
+  local exe_file="${work_dir}/bios_softpaq.exe"
+  if ! curl -L --max-time 300 --progress-bar "$softpaq_url" -o "$exe_file" 2>/dev/null; then
+    warn "BIOS: Download failed (URL: $softpaq_url)"
+    return 1
+  fi
+
+  info "BIOS: Extracting SoftPaq..."
+  local extract_dir="${work_dir}/extracted_sp"
+  if ! 7z x "$exe_file" -o"$extract_dir" -y >/dev/null 2>&1; then
+    warn "BIOS: SoftPaq extraction failed"
+    return 1
+  fi
+
+  local bin_file
+  bin_file=$(find "$extract_dir" -name "*.bin" | head -1)
+  if [[ -z "$bin_file" ]]; then
+    warn "BIOS: No .bin file found in SoftPaq"
+    return 1
+  fi
+
+  info "BIOS: Staging firmware to ${HP_DEVFW_PATH}/firmware.bin..."
+  if ! mkdir -p "$HP_DEVFW_PATH"; then
+    warn "BIOS: Cannot create ${HP_DEVFW_PATH} (ESP not mounted?)"
+    return 1
+  fi
+
+  cp "$bin_file" "${HP_DEVFW_PATH}/firmware.bin"
+  BIOS_UPDATE_STAGED=true
+  STATS[bios_staged]=1
+  info "BIOS: Update staged. On next boot: F10 → Update System BIOS to apply."
+  return 0
+}
+
+check_bios_update() {
+  if $SKIP_BIOS_CHECK; then
+    debug "BIOS: Check skipped (--skip-bios-check)"
+    return
+  fi
+
+  if ! command -v dmidecode >/dev/null 2>&1; then
+    debug "BIOS: dmidecode not found, skipping check"
+    return
+  fi
+
+  info "Checking for HP BIOS updates..."
+
+  local current_ver
+  current_ver=$(get_current_bios_version)
+  if [[ -z "$current_ver" ]]; then
+    warn "BIOS: Cannot determine current version — skipping"
+    return
+  fi
+  info "BIOS: Current version: ${current_ver}"
+
+  # --- Pass 1: try fwupd / LVFS ---
+  if command -v fwupdmgr >/dev/null 2>&1; then
+    local fwupd_ver
+    fwupd_ver=$(fwupdmgr get-updates 2>/dev/null \
+      | grep -A 10 "System Firmware" \
+      | grep "Available version:" \
+      | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+      | head -1)
+
+    if [[ -n "$fwupd_ver" ]]; then
+      info "BIOS: fwupd reports update available: ${current_ver} → ${fwupd_ver}"
+      if ! $DRY_RUN; then
+        if fwupdmgr update --no-reboot-check 2>/dev/null; then
+          BIOS_UPDATE_STAGED=true
+          STATS[bios_staged]=1
+          info "BIOS: fwupd staged update. Reboot required."
+        else
+          warn "BIOS: fwupd update staging failed — trying HP FTP fallback"
+        fi
+      else
+        info "[DRY RUN] Would apply BIOS update via fwupd (${current_ver} → ${fwupd_ver})"
+      fi
+      $BIOS_UPDATE_STAGED && return
+    else
+      debug "BIOS: No update on LVFS, trying HP FTP catalog"
+    fi
+  fi
+
+  # --- Pass 2: HP FTP imagepal catalog ---
+  local platform_id
+  platform_id=$(get_hp_platform_id)
+  if [[ -z "$platform_id" || ${#platform_id} -ne 4 ]]; then
+    info "BIOS: Could not detect HP platform ID (got '${platform_id}') — skipping FTP check"
+    info "BIOS: Check manually: https://support.hp.com/us-en/drivers/hp-elitebook-645-14-inch-g10-notebook-pc/2101880055"
+    return
+  fi
+  debug "BIOS: Platform ID: ${platform_id}"
+
+  local work_dir
+  work_dir=$(mktemp -d /var/tmp/hp-bios-XXXXXX)
+  # shellcheck disable=SC2064
+  trap "rm -rf '${work_dir}'" RETURN
+
+  local catalog_info
+  catalog_info=$(fetch_hp_bios_catalog "$platform_id" "$work_dir")
+
+  if [[ -z "$catalog_info" ]]; then
+    info "BIOS: HP catalog unavailable for platform ${platform_id}"
+    info "BIOS: Check manually: https://support.hp.com/us-en/drivers/hp-elitebook-645-14-inch-g10-notebook-pc/2101880055"
+    return
+  fi
+
+  local latest_ver softpaq_url
+  latest_ver=$(echo "$catalog_info" | awk '{print $1}')
+  softpaq_url=$(echo "$catalog_info" | awk '{print $2}')
+
+  info "BIOS: Latest available: ${latest_ver}"
+
+  if ! version_gt "$latest_ver" "$current_ver"; then
+    info "BIOS: Already up to date (${current_ver})"
+    return
+  fi
+
+  info "BIOS: Update available: ${current_ver} → ${latest_ver}"
+
+  if $DRY_RUN; then
+    info "[DRY RUN] Would download and stage BIOS update from ${softpaq_url}"
+    return
+  fi
+
+  stage_bios_update "$softpaq_url" "$work_dir" \
+    || warn "BIOS: Staging failed — update manually from HP support site"
+}
+
+#######################################
+# BROKEN SHARED LIBRARY SCAN
+#######################################
+scan_broken_links() {
+  if $SKIP_BROKEN_LINKS; then
+    info "Broken library scan skipped (--skip-broken-links)"
+    return
+  fi
+
+  # In non-interactive / cron mode skip the prompt entirely and just run the scan.
+  # In interactive mode, ask with a 10-second timeout; no answer = skip.
+  local do_scan=true
+  if $INTERACTIVE; then
+    local answer=""
+    echo "" >&2
+    # Print prompt directly to /dev/tty so it always appears even when stderr is redirected
+    printf '%s' "$(date '+%F %T') [INFO] Run broken shared library scan? [Y/n] (auto-skip in 10s): " >/dev/tty
+    if read -r -t 10 answer </dev/tty 2>/dev/null; then
+      # Got input — treat empty or Y/y as yes, anything else as no
+      if [[ -n "$answer" && ! "$answer" =~ ^[Yy]$ ]]; then
+        do_scan=false
+      fi
+    else
+      # Timeout — print a newline so the next log line isn't on the same line
+      printf '\n' >/dev/tty
+      info "No response in 10 seconds — skipping broken library scan"
+      do_scan=false
+    fi
+  fi
+
+  if ! $do_scan; then
+    return
+  fi
+
+  info "Scanning for broken shared library links..."
+
+  if ! command -v ldconfig >/dev/null 2>&1; then
+    warn "ldconfig not found; cannot scan for broken libraries"
+    return
+  fi
+
+  local broken_count=0
+
+  # Build the ldconfig cache fresh, then check every installed binary/library
+  # for unresolvable soname dependencies.
+  local tmpout
+  tmpout=$(mktemp /var/tmp/broken-libs-XXXXXX)
+  # shellcheck disable=SC2064
+  trap "rm -f '${tmpout}'" RETURN
+
+  if $DRY_RUN; then
+    info "[DRY RUN] Would run: ldconfig + check all ELF binaries for missing sonames"
+    return
+  fi
+
+  # Refresh ldconfig cache first so we don't get false positives from a stale cache
+  ldconfig 2>/dev/null || true
+
+  # ldd-based scan: iterate over all ELF files owned by pacman packages
+  while IFS= read -r elf; do
+    local ldd_out
+    ldd_out=$(ldd "$elf" 2>/dev/null) || continue
+    if echo "$ldd_out" | grep -q "not found"; then
+      local missing
+      missing=$(echo "$ldd_out" | awk '/not found/{print $1}' | sort -u | tr '\n' ' ')
+      printf '%s: %s\n' "$elf" "$missing" >> "$tmpout"
+      (( broken_count++ )) || true
+    fi
+  done < <(pacman -Ql 2>/dev/null \
+    | awk '{print $2}' \
+    | sort -u \
+    | xargs -d'\n' file -L 2>/dev/null \
+    | awk -F': ' '/ELF.*dynamically linked/{print $1}')
+
+  if [[ $broken_count -eq 0 ]]; then
+    info "No broken shared library links found"
+  else
+    warn "Found $broken_count ELF file(s) with missing shared libraries:"
+    while IFS= read -r line; do
+      warn "  $line"
+    done < "$tmpout"
+    warn "Run 'fix_broken_libs.py' or reinstall the affected packages to resolve."
+    local _ec=$(( STATS[error_count] + broken_count ))
+    STATS[error_count]=$_ec
+  fi
+}
+
+#######################################
+# MAIN
 #######################################
 main() {
   parse_args "$@"
 
-  # Initialize log file if specified
+  # Auto-log: dry-run goes to ~/.local/log to avoid requiring root
+  local _run_type="live"
+  local _log_dir="$AUTO_LOG_DIR"
+  if $DRY_RUN; then
+    _run_type="dry-run"
+    _log_dir="${HOME}/.local/log/cachyos-maintenance"
+  fi
+  mkdir -p "$_log_dir"
+  AUTO_LOG_FILE="${_log_dir}/$(date '+%F_%H-%M-%S')_${_run_type}.log"
+  touch "$AUTO_LOG_FILE" || { echo "Cannot write auto-log: $AUTO_LOG_FILE"; exit 1; }
+
+  # Initialize optional extra log file if specified
   if [[ -n "$LOG_FILE" ]]; then
     mkdir -p "$(dirname "$LOG_FILE")"
     touch "$LOG_FILE" || { echo "Cannot write to log file: $LOG_FILE"; exit 1; }
-    info "Logging to file: $LOG_FILE"
+    info "Also logging to: $LOG_FILE"
   fi
 
   check_root
 
   info "Starting $SCRIPT_NAME v$SCRIPT_VERSION"
+  info "Auto-log: $AUTO_LOG_FILE"
   $DRY_RUN    && warn "DRY RUN MODE — No changes will be made"
   $INTERACTIVE && info "Interactive mode enabled"
   $ENABLE_BACKUPS || warn "Backups disabled"
@@ -511,10 +1006,12 @@ main() {
   debug "Current package count: ${STATS[packages_before]}"
 
   update_system
+  check_bios_update
   clean_cache
   remove_orphans
   clean_logs
   clean_user_cache
+  scan_broken_links
 
   STATS[packages_after]=$(pacman -Q | wc -l | tr -d '[:space:]')
   STATS[packages_removed]=$((STATS[packages_before] - STATS[packages_after]))
@@ -523,10 +1020,12 @@ main() {
   info "Summary:"
   info "  Repo updates applied:   ${STATS[updates_repo]}"
   info "  AUR updates applied:    ${STATS[updates_aur]}"
+  info "  BIOS update staged:     ${STATS[bios_staged]}"
   info "  Packages removed:       ${STATS[packages_removed]}"
   info "  Errors encountered:     ${STATS[error_count]}"
   info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   info "Cleanup complete"
+  info "Full log saved to: $AUTO_LOG_FILE"
 
   # Reboot check always runs; prompt only in interactive mode
   handle_reboot
