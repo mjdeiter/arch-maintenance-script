@@ -4,6 +4,16 @@ All notable changes to cachyos-maintenance.sh are documented here.
 
 ---
 
+## [4.2.1] — dry-run hardening
+
+### Fixed
+- `check_bios_update()` now returns immediately with an info message in dry-run mode —
+  previously `fwupdmgr get-updates` would hang indefinitely without root
+- `snapshot_pre()` no longer runs `mkdir -p $SNAPSHOT_DIR` before the DRY_RUN guard
+- All dry-run paths now reach the summary block and exit cleanly (exit 0)
+
+---
+
 ## [4.2.0] — current
 
 ### Added

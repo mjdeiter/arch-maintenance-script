@@ -304,10 +304,10 @@ snapshot_prune() {
 snapshot_pre() {
   $ENABLE_BACKUPS || return
   is_btrfs_root || { debug "Not on Btrfs, skipping snapshot"; return; }
-  mkdir -p "$SNAPSHOT_DIR"
   local snap="${SNAPSHOT_DIR}/pre-$(date +%F_%H-%M-%S)"
   info "Creating pre-update snapshot: $snap"
   $DRY_RUN && { info "[DRY RUN] Would create: $snap"; return; }
+  mkdir -p "$SNAPSHOT_DIR"
   btrfs subvolume snapshot -r / "$snap"
   snapshot_prune
 }
@@ -790,6 +790,12 @@ stage_bios_update() {
 check_bios_update() {
   if $SKIP_BIOS_CHECK; then
     debug "BIOS: Check skipped (--skip-bios-check)"
+    return
+  fi
+
+  # dmidecode and fwupdmgr both require root; skip entirely in dry-run
+  if $DRY_RUN; then
+    info "[DRY RUN] Would check for HP BIOS updates (requires root, skipped)"
     return
   fi
 
