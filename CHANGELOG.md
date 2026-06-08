@@ -66,3 +66,13 @@ All notable changes to cachyos-maintenance.sh are documented here.
 ### Added
 - Docker/reboot feature merge
 - Initial public release
+
+---
+
+## [4.2.4] — fwupdmgr hang fix
+
+### Fixed
+- check_bios_update(): fwupdmgr get-updates now runs under timeout 30 to prevent
+  the BIOS check from hanging indefinitely when LVFS metadata refresh stalls on the network.
+  Previously a slow or unresponsive LVFS connection would block the entire script with no
+  timeout, causing the maintenance run to silently stall after logging the current BIOS version.

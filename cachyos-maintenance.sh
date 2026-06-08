@@ -41,7 +41,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # CONSTANTS & CONFIGURATION
 #######################################
 readonly SCRIPT_NAME="archOS Cleanup"
-readonly SCRIPT_VERSION="4.2.2"
+readonly SCRIPT_VERSION="4.2.4"
 
 readonly DATA_DIR="/var/lib/archos-cleanup"
 readonly SNAPSHOT_DIR="${DATA_DIR}/snapshots"
@@ -78,6 +78,7 @@ declare -A STATS=(
   [updates_repo]=0
   [updates_aur]=0
   [bios_staged]=0
+  [dkms_rebuilt]=0
   [error_count]=0
 )
 
@@ -369,6 +370,62 @@ stop_compose_stacks() {
   done <<< "$stacks"
 }
 
+
+#######################################
+# CORAL TPU DKMS CHECK
+#######################################
+# After a kernel upgrade the gasket/apex DKMS modules must be rebuilt or
+# /dev/apex_0 will be absent at next boot and Frigate will crash-loop.
+# This runs automatically when a kernel mismatch is detected.
+check_coral_dkms() {
+  local kernel
+  kernel=$(uname -r)
+
+  # Check if gasket is registered with DKMS at all
+  if ! dkms status gasket 2>/dev/null | grep -q "gasket/"; then
+    debug "CORAL: gasket not registered with DKMS — skipping"
+    return
+  fi
+
+  # Check if modules are already built for the installed kernel
+  local installed_kernel
+  installed_kernel=$(pacman -Q linux-cachyos 2>/dev/null | awk '{print $2}' | cut -d- -f1)
+  if [[ -z "$installed_kernel" ]]; then
+    debug "CORAL: Cannot detect installed kernel version — skipping DKMS check"
+    return
+  fi
+
+  local dkms_ver
+  dkms_ver=$(dkms status gasket 2>/dev/null | awk -F'[/,: ]+' '{print $2}' | head -1)
+
+  # Check for modules built specifically for the RUNNING kernel, not any kernel.
+  # After a reboot into a new kernel, dkms may show "installed" for the OLD kernel
+  # and incorrectly skip the rebuild — grep for the current kernel string explicitly.
+  if dkms status "gasket/${dkms_ver}" 2>/dev/null | grep -q "${kernel}.*installed"; then
+    info "CORAL: gasket/${dkms_ver} already installed for kernel ${kernel} — skipping"
+    return
+  fi
+
+  # Secondary: confirm .ko files actually exist on disk for this kernel
+  if [[ -f "/usr/lib/modules/${kernel}/updates/dkms/gasket.ko.zst" ]] || \
+     [[ -f "/usr/lib/modules/${kernel}/updates/dkms/gasket.ko" ]]; then
+    info "CORAL: gasket .ko present on disk for ${kernel} — skipping rebuild"
+    return
+  fi
+
+  info "CORAL: gasket/${dkms_ver} not built for kernel ${kernel} — rebuilding now..."
+  $DRY_RUN && { info "[DRY RUN] Would run: dkms install gasket/${dkms_ver} -k ${kernel}"; return; }
+
+  if sudo dkms install "gasket/${dkms_ver}" -k "$kernel" 2>&1 | while IFS= read -r line; do debug "CORAL: $line"; done; then
+    info "CORAL: Build succeeded — loading modules"
+    sudo modprobe gasket 2>/dev/null && sudo modprobe apex 2>/dev/null || warn "CORAL: modprobe failed — modules will load on next boot"
+    local _r=$(( STATS[dkms_rebuilt] + 1 ))
+    STATS[dkms_rebuilt]=$_r
+  else
+    warn "CORAL: DKMS build failed — /dev/apex_0 will be absent after reboot until manually rebuilt"
+  fi
+}
+
 #######################################
 # REBOOT DETECTION
 #######################################
@@ -417,6 +474,7 @@ handle_reboot() {
   fi
 
   if [[ "$reboot_needed" -eq 1 ]]; then
+    check_coral_dkms
     if $INTERACTIVE; then
       warn "Kernel update detected — a reboot is recommended"
       read -rp "Reboot now? (Docker Compose stacks will be stopped first) (y/N): " choice
@@ -817,7 +875,7 @@ check_bios_update() {
   # --- Pass 1: try fwupd / LVFS ---
   if command -v fwupdmgr >/dev/null 2>&1; then
     local fwupd_ver
-    fwupd_ver=$(fwupdmgr get-updates 2>/dev/null \
+    fwupd_ver=$(timeout 30 fwupdmgr get-updates 2>/dev/null \
       | grep -A 10 "System Firmware" \
       | grep "Available version:" \
       | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
@@ -993,6 +1051,52 @@ scan_broken_links() {
 }
 
 #######################################
+# ROLLING RUN LOG
+#######################################
+# Appends a one-line summary record to a persistent TSV log after every run.
+# Columns (tab-separated):
+#   timestamp  mode  kernel  repo_updates  aur_updates  pkgs_removed  errors  bios_staged  log_path
+ROLLING_LOG_FILE="/var/log/archos-cleanup/run-history.log"
+
+write_rolling_log() {
+  local mode="live"
+  $DRY_RUN && mode="dry-run"
+
+  local kernel_ver ts record target
+  kernel_ver=$(uname -r)
+  ts=$(date '+%F %T')
+
+  record=$(printf '%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%s' \
+    "$ts" "$mode" "$kernel_ver" \
+    "${STATS[updates_repo]}" "${STATS[updates_aur]}" \
+    "${STATS[packages_removed]}" "${STATS[error_count]}" \
+    "${STATS[bios_staged]}" "${AUTO_LOG_FILE:-n/a}")
+
+  # Dry-runs can't write to /var/log (no root); use user log dir instead
+  if $DRY_RUN; then
+    target="${HOME}/.local/log/cachyos-maintenance/run-history.log"
+  else
+    target="$ROLLING_LOG_FILE"
+  fi
+
+  # Ensure log directory exists (may be absent on first live run or after log rotation)
+  mkdir -p "$(dirname "$target")" || { warn "Could not create rolling log dir: $(dirname "$target")"; return; }
+
+  # Write TSV header if the file is new/empty
+  if [[ ! -s "$target" ]]; then
+    printf '%s\n' "# timestamp\tmode\tkernel\trepo_updates\taur_updates\tpkgs_removed\terrors\tbios_staged\tlog_path" >> "$target" \
+      || warn "Could not write rolling log header: $target"
+  fi
+
+  if printf '%s\n' "$record" >> "$target"; then
+    info "Rolling log updated: $target"
+  else
+    warn "Could not write to rolling log: $target"
+  fi
+}
+
+
+#######################################
 # MAIN
 #######################################
 main() {
@@ -1044,11 +1148,14 @@ main() {
   info "  Repo updates applied:   ${STATS[updates_repo]}"
   info "  AUR updates applied:    ${STATS[updates_aur]}"
   info "  BIOS update staged:     ${STATS[bios_staged]}"
+  info "  Coral DKMS rebuilt:     ${STATS[dkms_rebuilt]}"
   info "  Packages removed:       ${STATS[packages_removed]}"
   info "  Errors encountered:     ${STATS[error_count]}"
   info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   info "Cleanup complete"
   info "Full log saved to: $AUTO_LOG_FILE"
+
+  write_rolling_log
 
   # Reboot check always runs; prompt only in interactive mode
   handle_reboot
