@@ -76,3 +76,14 @@ All notable changes to cachyos-maintenance.sh are documented here.
   the BIOS check from hanging indefinitely when LVFS metadata refresh stalls on the network.
   Previously a slow or unresponsive LVFS connection would block the entire script with no
   timeout, causing the maintenance run to silently stall after logging the current BIOS version.
+
+---
+
+## [4.2.5] — Library Sentry Wine false positive suppression
+
+### Added
+- SENTRY_IGNORE_PATHS array to scan_broken_links(): path-prefix-based exclusion for ELF
+  files that use non-standard or internal linking not resolvable by ldd at scan time.
+- /usr/lib/wine/ added as the first ignored path: all Wine x86_64-unix .so files reference
+  ntdll.so and win32u.so as Wine-internal pseudo-DLLs that do not exist as real shared
+  objects on the host. This was causing 150+ false-positive errors on every scan run.

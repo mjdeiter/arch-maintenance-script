@@ -41,7 +41,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # CONSTANTS & CONFIGURATION
 #######################################
 readonly SCRIPT_NAME="archOS Cleanup"
-readonly SCRIPT_VERSION="4.2.4"
+readonly SCRIPT_VERSION="4.2.5"
 
 readonly DATA_DIR="/var/lib/archos-cleanup"
 readonly SNAPSHOT_DIR="${DATA_DIR}/snapshots"
@@ -1011,8 +1011,21 @@ scan_broken_links() {
     "libvapoursynth-script.so.0"  # symlink -> libvsscript.so; resolves fine via /usr/lib
   )
 
+  # Path prefixes to skip entirely — ELFs in these directories use internal pseudo-DLLs
+  # or non-standard linking that ldd cannot resolve but which work fine at runtime.
+  local -a SENTRY_IGNORE_PATHS=(
+    "/usr/lib/wine/"  # Wine x86_64-unix .so files reference ntdll.so/win32u.so internally
+  )
+
   # ldd-based scan: iterate over all ELF files owned by pacman packages
   while IFS= read -r elf; do
+    # Skip ELFs under ignored path prefixes (e.g. Wine pseudo-DLLs)
+    local path_ignored=false
+    for ignore_path in "${SENTRY_IGNORE_PATHS[@]}"; do
+      [[ "$elf" == "$ignore_path"* ]] && path_ignored=true && break
+    done
+    $path_ignored && continue
+
     local ldd_out
     ldd_out=$(ldd "$elf" 2>/dev/null) || continue
     if echo "$ldd_out" | grep -q "not found"; then
