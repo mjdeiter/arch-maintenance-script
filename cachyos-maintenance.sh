@@ -1,6 +1,6 @@
 #!/bin/bash
 # archOS / CachyOS System Cleanup and Update Script - ENTERPRISE EDITION
-# Version: 4.1.1
+# Version: 4.2.17
 #
 # Optimizations & Fixes:
 #   - Added command-line argument support
@@ -15,6 +15,110 @@
 #   - Kernel mismatch / reboot detection
 #   - Optional interactive reboot prompt (--interactive)
 #   - Broken shared library scan with timed interactive prompt (--skip-broken-links)
+#
+# v4.2.17 additions:
+# - check_pydantic_compat(): after tonight's incident where a system Python
+#   version bump silently broke pydantic/pydantic-core for elitebook-exec and
+#   llm-memory, and a separate cachetools/py-key-value-aio[memory] gap
+#   crash-looped letta-mcp-http, neither was caught until the services were
+#   already down. This check tries importing each known service's
+#   compiled-extension modules under the current python3 and warns before
+#   they crash-loop, instead of after.
+# - check_port_conflicts(): now tails the last journalctl error line (or last
+#   log line if none at err level) for any flagged crash-looping unit, so a
+#   flagged service comes with an actual pointer instead of requiring a
+#   manual journalctl dig every time.
+#
+# v4.2.16 fix:
+# - check_root(): AUR_USER fallback only covered the sudo-invocation path
+#   (SUDO_USER). A bare `--dry-run` with no sudo at all left AUR_USER empty
+#   even though a real non-root user was running it. Added a fallback to
+#   $USER/$LOGNAME when not root and SUDO_USER is unset, so AUR checks work
+#   on this single-user machine regardless of invocation style. Does not
+#   apply when actually running as root (e.g. root cron) with no SUDO_USER.
+#
+# v4.2.15 fix:
+# - check_root(): AUR_USER detection from SUDO_USER was only reached after
+#   the dry-run early-return, so --dry-run could never report AUR updates
+#   even when invoked via sudo. Moved SUDO_USER detection ahead of the
+#   dry-run check.
+# - sync_databases(): pacman -Sy requires root to write the synced DB
+#   files. When the script was invoked without sudo (including plain
+#   --dry-run runs), the sync failed silently (stderr suppressed) and the
+#   entire update check was skipped with no indication why. Now falls back
+#   to non-interactive `sudo -n` when EUID != 0.
+#
+# v4.2.14 fix:
+# - Reduced MAX_SNAPSHOTS from 10 to 3 (pre/post rollback subvols under
+#   SNAPSHOT_DIR). These are a second, separate set of full read-only Btrfs
+#   subvolumes layered on top of snapper's own pre/post snapshots of the
+#   same pacman transactions -- snapper already covers durable rollback
+#   history (NUMBER_LIMIT=15, correctly pruning). The script's own subvols
+#   only need to cover "did the last run itself break something," not deep
+#   history, and every extra one adds to Btrfs metadata-tree overhead.
+#   Found while investigating metadata usage sitting at 90.64% (same
+#   signature as the July 11 nested-subvolume incident, though this time
+#   snapper cleanup was completing successfully -- just generic churn from
+#   accumulated snapshot count). Existing excess subvols pruned manually
+#   same day, followed by a metadata-targeted balance.
+#
+# v4.2.13 fix:
+# - scan_broken_links(): excluded /usr/share/kicad/ from the pacman-Ql file
+#   list BEFORE the `file -L` pass, via a new SCAN_EXCLUDE_PATHS prefilter.
+#   KiCad's footprint/symbol libraries add tens of thousands of small
+#   non-ELF files that were previously run through `file -L` anyway before
+#   being dropped by the ELF filter. Note: this is a different mechanism
+#   from SENTRY_IGNORE_PATHS below, which only skips ldd checks on files
+#   already confirmed to be ELF -- that array can't speed up this step
+#   because the expensive part (file -L on every pacman-owned file) already
+#   ran before it's consulted.
+#
+# v4.2.12 fix:
+# - scan_broken_links(): added /opt/zen-browser-bin/ and /usr/lib/floorp/ to
+#   SENTRY_IGNORE_PATHS. Both are Gecko-based browsers whose bundled libs
+#   (libgkcodecs.so, libmozavutil.so, libmozsqlite3.so, libmozgtk.so,
+#   libmozsandbox.so, libmozwayland.so, liblgpllibs.so) resolve at runtime via
+#   xul.so's internal relative loading, not ld.so's default search path --
+#   same false-positive pattern as the wine/syslinux/systemd entries below.
+#
+# v4.2.11 fixes:
+# - update_repo_packages(): added STATS[repo_applied], tracked separately from
+#   STATS[updates_repo] (which is the pre-run available count). Previously the
+#   summary printed the available count as "applied" even when the pacman
+#   transaction failed outright (e.g. untrusted-key abort) and 0 packages were
+#   actually installed. Summary and rolling-log now report repo_applied.
+# - scan_broken_links(): added /usr/lib/syslinux/ and /usr/lib/systemd/ to
+#   SENTRY_IGNORE_PATHS. syslinux .c32 modules use their own COM32 loader, not
+#   ld.so, and systemd's private plugin libs (e.g. libsystemd-core ->
+#   libsystemd-shared) resolve via $ORIGIN at runtime despite living outside
+#   ld.so's default search path. Both were previously flagged as false-positive
+#   broken links on every run.
+#
+# v4.2.10 fix:
+# - update_repo_packages() call in update_system() is now only reached through
+#   an outer guarded call (update_system || { ... continue ... }), so a pacman
+#   failure no longer aborts AUR updates / BIOS check / Alexa check / cleanup.
+#
+# v4.2.9 fix:
+# - check_btrfs_health(): orphaned-subvolume grep pipeline appended with `|| true`
+#   so a no-match result (exit 1) no longer aborts the script under set -e.
+#
+# v4.2.7 additions:
+# - check_alexa_media_patch(): verifies the alexa_media custom_components
+#   update_last_called() no-op patch (workaround for upstream issue #3019/#3132,
+#   TypeError: Cannot serialize non-str key None) is still present on the HA host
+#   (192.168.4.222). If a HACS update overwrote it, reruns reapply_patch.sh
+#   remotely and flags that an HA core restart is needed.
+#
+# v4.2.5 fix:
+# - scan_broken_links(): added /usr/lib/wine/ to SENTRY_IGNORE_PATHS. Wine's
+#   x86_64-unix .so files reference ntdll.so/win32u.so internally rather than
+#   via ld.so's default search path, flagging as a false-positive broken link
+#   on every run.
+# - check_bios_update(): added timeout 30 to fwupdmgr get-updates, which could
+#   hang indefinitely with no network path to HP's firmware catalog.
+# - Dry-run hardening: BIOS check now skips cleanly without root, snapshot
+#   directory creation guarded against already existing.
 #
 # v4.1.3 additions:
 # - resolve_aur_dep_conflicts(): auto-detects AUR pkgs blocking repo soname bumps,
@@ -41,7 +145,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # CONSTANTS & CONFIGURATION
 #######################################
 readonly SCRIPT_NAME="archOS Cleanup"
-readonly SCRIPT_VERSION="4.2.5"
+readonly SCRIPT_VERSION="4.2.17"
 
 readonly DATA_DIR="/var/lib/archos-cleanup"
 readonly SNAPSHOT_DIR="${DATA_DIR}/snapshots"
@@ -50,7 +154,7 @@ readonly AUTO_LOG_DIR="/var/log/archos-cleanup"
 readonly SYSTEM_LOG_DIR="/var/log"
 readonly VAR_TMP_DIR="/var/tmp"
 
-readonly MAX_SNAPSHOTS=10
+readonly MAX_SNAPSHOTS=3
 readonly LOG_RETENTION_DAYS=7
 readonly CACHE_VERSIONS=3
 
@@ -76,9 +180,12 @@ declare -A STATS=(
   [packages_after]=0
   [packages_removed]=0
   [updates_repo]=0
+  [repo_applied]=0
   [updates_aur]=0
   [bios_staged]=0
   [dkms_rebuilt]=0
+  [alexa_patch_reapplied]=0
+  [pydantic_issues]=0
   [error_count]=0
 )
 
@@ -208,11 +315,16 @@ error(){
 # SAFETY
 #######################################
 check_root() {
-  $DRY_RUN && { warn "Dry-run mode: skipping root check"; return; }
-  [[ $EUID -eq 0 ]] || { echo "Must be run as root"; exit 1; }
   if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
     AUR_USER="$SUDO_USER"
-  else
+  elif [[ $EUID -ne 0 && -n "${USER:-${LOGNAME:-}}" && "${USER:-${LOGNAME:-}}" != "root" ]]; then
+    # v4.2.16: not invoked via sudo (e.g. bare --dry-run) — fall back to the
+    # invoking non-root user so AUR checks still work on this single-user box.
+    AUR_USER="${USER:-${LOGNAME}}"
+  fi
+  $DRY_RUN && { warn "Dry-run mode: skipping root check"; return; }
+  [[ $EUID -eq 0 ]] || { echo "Must be run as root"; exit 1; }
+  if [[ -z "$AUR_USER" ]]; then
     warn "SUDO_USER not set or is root — AUR updates will be skipped"
   fi
 }
@@ -288,17 +400,19 @@ is_btrfs_root() {
 }
 
 snapshot_prune() {
-  debug "Pruning old snapshots (keeping $MAX_SNAPSHOTS)"
-  local candidates
-  mapfile -t candidates < <(ls -1d "${SNAPSHOT_DIR}"/pre-* 2>/dev/null | sort -r | tail -n +$((MAX_SNAPSHOTS + 1)))
-  for path in "${candidates[@]}"; do
-    if btrfs subvolume show "$path" &>/dev/null; then
-      debug "Deleting old snapshot: $path"
-      btrfs subvolume delete "$path"
-    else
-      warn "Non-subvolume entry found, removing: $path"
-      rm -rf "$path"
-    fi
+  debug "Pruning old snapshots (keeping $MAX_SNAPSHOTS of each type)"
+  local prefix candidates
+  for prefix in pre post; do
+    mapfile -t candidates < <(ls -1d "${SNAPSHOT_DIR}/${prefix}-"* 2>/dev/null | sort -r | tail -n +$((MAX_SNAPSHOTS + 1)))
+    for path in "${candidates[@]}"; do
+      if btrfs subvolume show "$path" &>/dev/null; then
+        debug "Deleting old snapshot: $path"
+        btrfs subvolume delete "$path"
+      else
+        warn "Non-subvolume entry found, removing: $path"
+        rm -rf "$path"
+      fi
+    done
   done
 }
 
@@ -377,6 +491,19 @@ stop_compose_stacks() {
 # After a kernel upgrade the gasket/apex DKMS modules must be rebuilt or
 # /dev/apex_0 will be absent at next boot and Frigate will crash-loop.
 # This runs automatically when a kernel mismatch is detected.
+#
+# HISTORICAL NOTE (resolved 2026-08-30): kernel 7.1.1 briefly broke
+# gasket/apex DKMS by removing the zap_vma_ptes() symbol the driver
+# relied on. /etc/pacman.conf carried an IgnorePkg hold on
+# linux-cachyos/linux-cachyos-headers as a workaround from then until
+# 2026-08-30. The gasket-dkms-git AUR package was patched upstream on
+# 2026-07-27 (commit b1c1958) to use zap_special_vma_range on newer
+# kernels with a fallback to zap_vma_ptes on older ones, so the fix now
+# lives in the driver itself and isn't tied to holding back a specific
+# kernel version. The IgnorePkg hold was removed 2026-08-30 — this
+# function's normal DKMS-rebuild-on-mismatch handling is expected to be
+# sufficient going forward; no kernel pin should be needed again for
+# this reason.
 check_coral_dkms() {
   local kernel
   kernel=$(uname -r)
@@ -423,6 +550,43 @@ check_coral_dkms() {
     STATS[dkms_rebuilt]=$_r
   else
     warn "CORAL: DKMS build failed — /dev/apex_0 will be absent after reboot until manually rebuilt"
+  fi
+}
+
+#######################################
+# REMOTE: HOME ASSISTANT ALEXA_MEDIA PATCH
+#######################################
+check_alexa_media_patch() {
+  local ha_host="root@192.168.4.222"
+  local patch_script="/homeassistant/custom_components/alexa_media/reapply_patch.sh"
+  local ha_label="192.168.4.222"
+
+  debug "ALEXA: Checking alexa_media update_last_called patch on ${ha_label}"
+
+  if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$ha_host" "test -x '$patch_script'" 2>/dev/null; then
+    warn "ALEXA: Cannot reach ${ha_label} (or reapply_patch.sh missing) — skipping"
+    return
+  fi
+
+  if $DRY_RUN; then
+    info "[DRY RUN] Would run reapply_patch.sh on ${ha_label}"
+    return
+  fi
+
+  local _output
+  if ! _output=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$ha_host" "$patch_script" 2>&1); then
+    warn "ALEXA: reapply_patch.sh exited non-zero on ${ha_label} — manual check needed:"
+    while IFS= read -r line; do warn "ALEXA: $line"; done <<< "$_output"
+    return
+  fi
+
+  if echo "$_output" | grep -q "already present"; then
+    debug "ALEXA: update_last_called patch already in place — no action needed"
+  else
+    warn "ALEXA: alexa_media patch was missing on ${ha_label} and has been reapplied (likely overwritten by a HACS update) — HA core restart required to take effect"
+    while IFS= read -r line; do info "ALEXA: $line"; done <<< "$_output"
+    local _r=$(( STATS[alexa_patch_reapplied] + 1 ))
+    STATS[alexa_patch_reapplied]=$_r
   fi
 }
 
@@ -499,11 +663,18 @@ handle_reboot() {
 #######################################
 sync_databases() {
   debug "Syncing package databases..."
-  if ! $DRY_RUN; then
-    timeout 60 pacman -Sy --noconfirm 2>/dev/null || {
-      warn "Failed to sync package databases"
-      return 1
-    }
+  # Always sync DB even in dry-run — it is read-only and needed for accurate update counts
+  # v4.2.15 fix: pacman -Sy requires root to write synced DB files. In dry-run
+  # mode (or if invoked without sudo generally) EUID may not be 0, in which
+  # case the sync silently failed and the whole update check was skipped.
+  # Fall back to sudo -n (non-interactive) when not already root.
+  local sync_cmd=(pacman -Sy --noconfirm)
+  if [[ $EUID -ne 0 ]]; then
+    sync_cmd=(sudo -n pacman -Sy --noconfirm)
+  fi
+  if ! timeout 60 "${sync_cmd[@]}" 2>/dev/null; then
+    warn "Failed to sync package databases"
+    return 1
   fi
   return 0
 }
@@ -580,6 +751,7 @@ update_repo_packages() {
         if resolve_aur_dep_conflicts "$_pac_output"; then
           info "Rebuild succeeded — retrying repo upgrade..."
           with_pacman_lock pacman -Su --noconfirm $_ignore_flag
+          STATS[repo_applied]=${STATS[updates_repo]}
         else
           warn "Auto-rebuild failed — manual intervention required"
           return 1
@@ -588,6 +760,8 @@ update_repo_packages() {
         warn "pacman upgrade failed (rc=$_pac_rc)"
         return 1
       fi
+    else
+      STATS[repo_applied]=${STATS[updates_repo]}
     fi
   else
     info "No repo updates to apply"
@@ -845,6 +1019,141 @@ stage_bios_update() {
   return 0
 }
 
+check_port_conflicts() {
+  info "Checking for crash-looping services caused by port conflicts..."
+
+  local failed_units unit restarts port_line last_err
+  failed_units=$(systemctl list-units --type=service --state=running,failed --no-legend --plain 2>/dev/null | awk '{print $1}')
+
+  local flagged=0
+  while IFS= read -r unit; do
+    [[ -z "$unit" ]] && continue
+    restarts=$(systemctl show "$unit" -p NRestarts --value 2>/dev/null)
+    if [[ "$restarts" =~ ^[0-9]+$ ]] && (( restarts >= 5 )); then
+      port_line=$(journalctl -u "$unit" -n 50 --no-pager 2>/dev/null | grep -i "address already in use" | tail -1)
+
+      # v4.2.17: tail the last actual error line so a flagged unit comes with
+      # a concrete pointer instead of requiring a manual journalctl dig every
+      # time. Prefer the last err-priority line; fall back to the last log
+      # line if nothing was logged at err level.
+      last_err=$(journalctl -u "$unit" -n 50 --no-pager -p err 2>/dev/null | tail -1)
+      [[ -z "$last_err" ]] && last_err=$(journalctl -u "$unit" -n 5 --no-pager 2>/dev/null | tail -1)
+
+      if [[ -n "$port_line" ]]; then
+        warn "Port conflict detected: $unit has restarted $restarts times - $port_line"
+        STATS[port_conflicts]=$(( ${STATS[port_conflicts]:-0} + 1 ))
+        flagged=1
+      elif (( restarts >= 15 )); then
+        warn "Service $unit has restarted $restarts times with no port conflict message - investigate manually"
+        [[ -n "$last_err" ]] && warn "  last log line: $last_err"
+        STATS[port_conflicts]=$(( ${STATS[port_conflicts]:-0} + 1 ))
+        flagged=1
+      fi
+    fi
+  done <<< "$failed_units"
+
+  if (( flagged == 0 )); then
+    debug "No crash-looping services detected"
+  else
+    warn "Port/crash-loop check flagged $flagged service(s) - check for duplicate system+user level units (see elitebook-exec incident 2026-07-08)"
+  fi
+}
+
+#######################################
+# PYTHON / PIP COMPATIBILITY CHECK
+#######################################
+# A system Python version bump can silently break --user-installed pip
+# packages with compiled C extensions (pydantic-core, cachetools, etc.) that
+# were built against the old CPython ABI. This surfaced on 2026-09-15: a
+# Python 3.14 bump broke pydantic/pydantic-core for elitebook-exec and
+# llm-memory, and a separate cachetools/py-key-value-aio[memory] gap
+# crash-looped letta-mcp-http. Neither was caught until the services were
+# already down. This tries importing each known service's modules under the
+# current python3 and flags anything that fails before it becomes a
+# crash loop.
+check_pydantic_compat() {
+  info "Checking Python/pip compatibility for pip-dependent services..."
+
+  local current_py
+  current_py=$(python3 --version 2>&1)
+  debug "PYCHECK: Running python3: $current_py"
+
+  # Service name -> space-separated list of its compiled-extension imports.
+  local -A PY_SERVICE_MODULES=(
+    [elitebook-exec.service]="pydantic pydantic_core"
+    [llm-memory.service]="pydantic pydantic_core"
+    [letta-mcp-http.service]="cachetools"
+  )
+
+  local flagged=0
+  local svc modules mod
+  for svc in "${!PY_SERVICE_MODULES[@]}"; do
+    if ! systemctl list-unit-files "$svc" 2>/dev/null | grep -q "$svc"; then
+      debug "PYCHECK: $svc not installed on this host — skipping"
+      continue
+    fi
+
+    modules="${PY_SERVICE_MODULES[$svc]}"
+    for mod in $modules; do
+      if ! python3 -c "import ${mod}" >/dev/null 2>&1; then
+        warn "PYCHECK: $svc depends on '$mod', which fails to import under $current_py — will crash-loop on next start/restart"
+        STATS[pydantic_issues]=$(( STATS[pydantic_issues] + 1 ))
+        flagged=1
+      fi
+    done
+  done
+
+  if (( flagged == 0 )); then
+    debug "PYCHECK: All checked pip modules import cleanly under $current_py"
+  else
+    warn "PYCHECK: reinstall the affected package(s) with 'pip install --user --force-reinstall --no-cache-dir <pkg>', or pin the system Python version, then restart the affected service(s)."
+  fi
+}
+
+check_btrfs_health() {
+  info "Checking Btrfs metadata usage and subvolume health..."
+
+  local meta_line meta_pct
+  meta_line=$(sudo btrfs filesystem usage / 2>/dev/null | grep -E "^Metadata,")
+  if [[ -z "$meta_line" ]]; then
+    debug "Could not read Btrfs metadata usage; skipping"
+    return 0
+  fi
+
+  # Extract percentage like "91.80%" from "Metadata,DUP: Size:25.00GiB, Used:22.95GiB (91.80%)"
+  meta_pct=$(echo "$meta_line" | grep -oP '\(\K[0-9.]+(?=%\))')
+
+  if [[ -n "$meta_pct" ]]; then
+    debug "Btrfs metadata usage: ${meta_pct}%"
+    if (( $(echo "$meta_pct > 80" | bc -l 2>/dev/null || echo 0) )); then
+      warn "Btrfs metadata usage is high: ${meta_pct}% -- consider a balance pass or check for orphaned subvolumes"
+    fi
+  fi
+
+  # Flag anything that looks like a manual rollback/backup tree left behind.
+  # Known-good subvolumes (@, @home, @root, @srv, @cache, @tmp, @log, @snapshots
+  # and their nested children) are NOT matched by this pattern.
+  local orphans
+  orphans=$(sudo btrfs subvolume list / 2>/dev/null \
+    | awk '{print $NF}' \
+    | grep -E '^@.*(_old|_pre_rollback|_rollback|_backup|_failed)' \
+    | grep -vE '/' \
+    | sort -u) || true
+
+  if [[ -n "$orphans" ]]; then
+    local orphan_count
+    orphan_count=$(echo "$orphans" | wc -l)
+    warn "Found ${orphan_count} orphaned-looking Btrfs subvolume root(s) outside normal naming:"
+    while IFS= read -r o; do
+      warn "  -> $o"
+    done <<< "$orphans"
+    warn "Not auto-deleted -- review manually: sudo btrfs subvolume list / | grep '<name>'"
+    warn "If confirmed unneeded, delete nested children bottom-up before the parent."
+  else
+    debug "No orphaned rollback/backup subvolume trees detected"
+  fi
+}
+
 check_bios_update() {
   if $SKIP_BIOS_CHECK; then
     debug "BIOS: Check skipped (--skip-bios-check)"
@@ -1011,10 +1320,25 @@ scan_broken_links() {
     "libvapoursynth-script.so.0"  # symlink -> libvsscript.so; resolves fine via /usr/lib
   )
 
+  # Directories with large non-ELF file counts, excluded from the file(1) scan
+  # itself (before the ELF filter runs) so we don't waste time running `file`
+  # on tens of thousands of assets that will never be ELF binaries.
+  local -a SCAN_EXCLUDE_PATHS=(
+    "/usr/share/kicad/"   # footprints/symbols/3dmodels — text/step files, never ELF
+  )
+
   # Path prefixes to skip entirely — ELFs in these directories use internal pseudo-DLLs
   # or non-standard linking that ldd cannot resolve but which work fine at runtime.
+  #
+  # /usr/lib/systemd/ note: private plugin libs (e.g. libsystemd-core.so ->
+  # libsystemd-shared.so) sit right next to their dependencies but outside ld.so's
+  # default search path; they resolve via $ORIGIN-relative loading at runtime.
   local -a SENTRY_IGNORE_PATHS=(
-    "/usr/lib/wine/"  # Wine x86_64-unix .so files reference ntdll.so/win32u.so internally
+    "/usr/lib/wine/"        # Wine x86_64-unix .so files reference ntdll.so/win32u.so internally
+    "/usr/lib/syslinux/"    # COM32 modules use syslinux's own object loader, not ld.so
+    "/usr/lib/systemd/"     # private plugin libs resolve via $ORIGIN, not ld.so's search path
+    "/opt/zen-browser-bin/" # Gecko bundled libs resolve via xul.so's internal relative loading
+    "/usr/lib/floorp/"      # same Gecko internal-loading pattern as zen-browser-bin above
   )
 
   # ldd-based scan: iterate over all ELF files owned by pacman packages
@@ -1047,6 +1371,7 @@ scan_broken_links() {
   done < <(pacman -Ql 2>/dev/null \
     | awk '{print $2}' \
     | sort -u \
+    | grep -vE "^($(IFS='|'; echo "${SCAN_EXCLUDE_PATHS[*]}"))" \
     | xargs -d'\n' file -L 2>/dev/null \
     | awk -F': ' '/ELF.*dynamically linked/{print $1}')
 
@@ -1081,7 +1406,7 @@ write_rolling_log() {
 
   record=$(printf '%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%s' \
     "$ts" "$mode" "$kernel_ver" \
-    "${STATS[updates_repo]}" "${STATS[updates_aur]}" \
+    "${STATS[repo_applied]}" "${STATS[updates_aur]}" \
     "${STATS[packages_removed]}" "${STATS[error_count]}" \
     "${STATS[bios_staged]}" "${AUTO_LOG_FILE:-n/a}")
 
@@ -1145,23 +1470,37 @@ main() {
   STATS[packages_before]=$(pacman -Q | wc -l | tr -d '[:space:]')
   debug "Current package count: ${STATS[packages_before]}"
 
-  update_system
-  check_bios_update
-  clean_cache
-  remove_orphans
-  clean_logs
-  clean_user_cache
-  scan_broken_links
+  # Each step is guarded with || so a non-fatal failure in one step
+  # (e.g. a pacman transaction error) can't silently abort every step
+  # after it under `set -e`. See error() history note above -- this is
+  # the same class of bug, just at the main() call-site level.
+  update_system           || { STATS[error_count]=$((STATS[error_count] + 1)); warn "update_system step failed - continuing with remaining checks"; }
+  check_pydantic_compat   || { STATS[error_count]=$((STATS[error_count] + 1)); warn "check_pydantic_compat step failed - continuing"; }
+  check_bios_update       || { STATS[error_count]=$((STATS[error_count] + 1)); warn "check_bios_update step failed - continuing"; }
+  check_alexa_media_patch || { STATS[error_count]=$((STATS[error_count] + 1)); warn "check_alexa_media_patch step failed - continuing"; }
+  check_port_conflicts    || { STATS[error_count]=$((STATS[error_count] + 1)); warn "check_port_conflicts step failed - continuing"; }
+  check_btrfs_health      || { STATS[error_count]=$((STATS[error_count] + 1)); warn "check_btrfs_health step failed - continuing"; }
+  clean_cache             || { STATS[error_count]=$((STATS[error_count] + 1)); warn "clean_cache step failed - continuing"; }
+  remove_orphans          || { STATS[error_count]=$((STATS[error_count] + 1)); warn "remove_orphans step failed - continuing"; }
+  clean_logs              || { STATS[error_count]=$((STATS[error_count] + 1)); warn "clean_logs step failed - continuing"; }
+  clean_user_cache        || { STATS[error_count]=$((STATS[error_count] + 1)); warn "clean_user_cache step failed - continuing"; }
+  scan_broken_links       || { STATS[error_count]=$((STATS[error_count] + 1)); warn "scan_broken_links step failed - continuing"; }
 
   STATS[packages_after]=$(pacman -Q | wc -l | tr -d '[:space:]')
   STATS[packages_removed]=$((STATS[packages_before] - STATS[packages_after]))
 
   info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   info "Summary:"
-  info "  Repo updates applied:   ${STATS[updates_repo]}"
+  if (( STATS[repo_applied] < STATS[updates_repo] )); then
+    info "  Repo updates applied:   ${STATS[repo_applied]} / ${STATS[updates_repo]} available (see warnings above)"
+  else
+    info "  Repo updates applied:   ${STATS[repo_applied]}"
+  fi
   info "  AUR updates applied:    ${STATS[updates_aur]}"
   info "  BIOS update staged:     ${STATS[bios_staged]}"
   info "  Coral DKMS rebuilt:     ${STATS[dkms_rebuilt]}"
+  info "  Alexa patch reapplied:  ${STATS[alexa_patch_reapplied]}"
+  info "  Python/pip compat issues: ${STATS[pydantic_issues]}"
   info "  Packages removed:       ${STATS[packages_removed]}"
   info "  Errors encountered:     ${STATS[error_count]}"
   info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
